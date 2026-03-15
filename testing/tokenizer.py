@@ -10,8 +10,11 @@ import math
 from typing import Optional, Union, List, Tuple, Dict, Any , Callable
 from transformers.processing_utils import Unpack
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
+
+# wow xformers got so much new things!
 from transformers.activations import ACT2FN
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.integrations import use_kernel_forward_from_hub
 
 
 # Utils for doing GQA 
@@ -141,7 +144,7 @@ class Qwen3SpeechTokenizerDecoderAttention(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor],
         past_key_values: Optional[torch.Tensor],
-        cache_position: Optional[torch.Tensor],
+        cache_position: Optional[torch.Tensor], # whats this ? 
         **kwargs: Unpack[FlashAttentionKwargs],
     ):
 
@@ -152,8 +155,14 @@ class Qwen3SpeechTokenizerDecoderAttention(nn.Module):
         key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2) # (B , -1, T, H)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2) # (B , -1, T, H)
 
+        cos,sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin) # TBD later
+
         if past_key_values is not None:
-            pass
+            # sin and cos are specific to RoPE models; cache_position needed for the static cache
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
 
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
@@ -189,6 +198,7 @@ class Qwen3SpeechTokenizerDecoderMLP(nn.Module):
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
 
+@use_kernel_forward_from_hub("RMSNorm")
 class Qwen3SpeechTokenizerDecoderRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps: float = 1e-6) -> None:
         super().__init__()
@@ -198,16 +208,75 @@ class Qwen3SpeechTokenizerDecoderRMSNorm(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True) # square > mean > root
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * hidden_states.to(input_dtype)
     
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
-# LayerScale ? ( )
-# deeper layer are much less effective than expected so we initialize a diagnol matrix that learns this 
+# LayerScale ? (https://huggingface.co/papers/2103.17239)
+# deeper layer are much less effective than expected so we initialize a diagnol matrix that learns a channel scaling values for each channel  
+# so the problem taht occurs in the deep stacks is while going till last layer we already have accumulate so much information that we dont get any more new meaningful information after that and last layers tend to learn nothing
+class Qwen3SpeechTokenizerDecoderLayerScale(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.initial_scale = config.layer_scale_initial_scale
+        self.scale = nn.Parameter(torch.full((self.hidden_size,), self.initial_scale, requires_grad=True))
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.scale * x
 
+# summation of whatall we did above :)  
+class Qwen3SpeechTokenizerDecoderTransformerLayer(nn.Module):
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.self_attn = Qwen3SpeechTokenizerDecoderAttention(config, layer_idx)
+        self.mlp = Qwen3SpeechTokenizerDecoderMLP(config)
+        self.input_layernorm = Qwen3SpeechTokenizerDecoderRMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.post_attention_layernorm = Qwen3SpeechTokenizerDecoderRMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.self_attn_layer_scale = Qwen3SpeechTokenizerDecoderLayerScale(config)
+        self.mlp_layer_scale = Qwen3SpeechTokenizerDecoderLayerScale(config)
+        self.attention_type = "sliding_attention"
+    
+    def forward(
+        self, 
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[torch.Tensor] = None,
+        use_cache: Optional[bool] = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs: Unpack[FlashAttentionKwargs],
+    ):
+
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states, self_attn_weights = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            **kwargs,
+        )
+
+        hidden_states = residual + self.self_attn_layer_scale(hidden_states)
+        
+        # MLP 
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + self.mlp_layer_scale(hidden_states)
+        return hidden_states, self_attn_weights
+
+
+
+# --x--- 
 
 class Qwen3SpeechTokenizerStreaming(nn.Module):
     def __init__(self):
