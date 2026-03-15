@@ -166,6 +166,9 @@ class Qwen3TTSTokenizerV2CausalConvNet(nn.Module):
         stride=1,
         groups=1,
     ):
+        '''
+        so convs are used as a channel mixer , as first we that input needs to flattened then only we can do conv over that flattened input 
+        '''
         super().__init__()
         self.conv = nn.Conv1d(
             in_channels,
