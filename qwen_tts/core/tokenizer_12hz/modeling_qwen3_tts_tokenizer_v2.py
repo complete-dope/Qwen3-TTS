@@ -474,7 +474,6 @@ class Qwen3TTSTokenizerV2DecoderTransformerLayer(GradientCheckpointingLayer):
 
         return hidden_states
 
-# --x--- 
 
 @auto_docstring
 class Qwen3TTSTokenizerV2DecoderTransformerModel(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
@@ -730,7 +729,7 @@ class ResidualVectorQuantization(nn.Module):
             quantized = quantized + layer.decode(layer_codes)
         return quantized
 
-
+# --- X----
 class ResidualVectorQuantizer(nn.Module):
     def __init__(
         self,

@@ -7,6 +7,7 @@ import torch.nn.functional as F
 
 
 import math
+from dataclasses import dataclass 
 from typing import Optional, Union, List, Tuple, Dict, Any , Callable
 from transformers.processing_utils import Unpack
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
@@ -15,7 +16,18 @@ from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.activations import ACT2FN
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.integrations import use_kernel_forward_from_hub
+from transformers.utils import auto_docstring
+from transformers.modeling_utils import PreTrainedModel
+from transformers.utils import ModelOutput, auto_docstring, logging
+from transformers.masking_utils import (
+    create_causal_mask,
+    create_sliding_window_causal_mask,
+)
+from transformers.modeling_outputs import BaseModelOutputWithPast
 
+
+
+from .tokenizer_configuration import Qwen3TTSTokenizerV2Config, Qwen3TTSTokenizerV2DecoderConfig
 
 # Utils for doing GQA 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -51,6 +63,42 @@ def eager_attention_forward(
     return attn_output, attn_weights
 
 
+@dataclass
+@auto_docstring
+class Qwen3TTSTokenizerV2EncoderOutput(ModelOutput):
+    r"""
+    audio_codes (`List[torch.LongTensor]`):
+        Discret code embeddings computed using `model.encode`, each tensor has shape (codes_length_i, num_quantizers).
+    """
+
+    audio_codes: List[torch.LongTensor] = None # encoder output is audio-codec
+    # [12 ,123,421, 41 , ... ]
+
+
+@dataclass
+@auto_docstring
+class Qwen3TTSTokenizerV2DecoderOutput(ModelOutput):
+    r"""
+    audio_values (`List[torch.FloatTensor]`):
+        Decoded audio values, obtained using the decoder part of Qwen3TTSTokenizerV1.
+        Each tensor has shape (segment_length_i).
+    """
+
+    audio_values: List[torch.FloatTensor] = None # decoder output is audio-value
+    # [12.1 , 32.1 , 43.1 , 23.4 , ... ]
+
+
+
+@auto_docstring
+class Qwen3TTSTokenizerV2DecoderPreTrainedModel(PreTrainedModel):
+    config: Qwen3TTSTokenizerV2DecoderConfig
+    base_model_prefix = "model"
+    supports_gradient_checkpointing = True
+    _skip_keys_device_placement = "past_key_values"
+    _supports_flash_attn = True
+    _supports_sdpa = True
+    _can_compile_fullgraph = False
+    _supports_attention_backend = True
 
 
 class Qwen3SpeechTokenizerCausalConvNet(nn.Module):
@@ -275,8 +323,305 @@ class Qwen3SpeechTokenizerDecoderTransformerLayer(nn.Module):
         return hidden_states, self_attn_weights
 
 
+# this is one part of a decoder model , where we are using transformer 
+class Qwen3SpeechTokenizerDecoderTransformerModel(Qwen3TTSTokenizerV2DecoderPreTrainedModel): # TBD: what is this tokenizer decoder 
+    _can_record_outputs = {
+        "hidden_states": Qwen3SpeechTokenizerDecoderTransformerLayer,
+        "attentions": Qwen3SpeechTokenizerDecoderAttention,
+    }
 
-# --x--- 
+    def __init__(self, config: Qwen3TTSTokenizerV2Config):
+        super().__init__(config)
+        self.layers = nn.ModuleList(
+            [Qwen3SpeechTokenizerDecoderTransformerLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+        )
+        self.norm = Qwen3SpeechTokenizerDecoderRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = Qwen3SpeechTokenizerDecoderRotaryEmbedding(config.head_dim)
+        self.gradient_checkpointing = False
+        self.has_sliding_layers = "sliding_attention" in self.config.layer_types # in 2026 we are stil using sliding attention ? 
+        self.window_size = config.sliding_window
+        
+        self.input_proj = nn.Linear(config.latent_dim, config.hidden_size)
+        self.output_proj = nn.Linear(config.hidden_size, config.latent_dim)
+
+        # Initialize weights and apply final processing
+        self.post_init() #this initializes model from parent class but does it initialize random weights or some pretrained weights ? This boils down to `_init_weights` function from PreTrainedModel class and it initializes empty weights with mean and std 
+
+
+    def forward(
+        self,
+        input_ids=None, 
+        attention_mask=None, 
+        position_ids=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        use_cache=None,
+        cache_position=None,
+        **kwargs,
+
+    ) -> Qwen3TTSTokenizerV2DecoderOutput:
+        if input_ids is not None: # input_ids can never pass through this filter
+            raise ValueError("input_ids is not expected")
+        if (input_ids is None) ^ (inputs_embeds is not None): # xor operator
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+
+        inputs_embeds = self.input_proj(inputs_embeds)
+        
+        # TBD later ( cache scene )
+        if use_cache and past_key_values is None:
+            past_key_values = DynamicCache(config=self.config)
+
+        if cache_position is None:
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            cache_position = torch.arange(
+                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+            )
+
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0)
+
+        if not isinstance(causal_mask_mapping := attention_mask, dict):
+            mask_kwargs = {
+                "config": self.config,
+                "input_embeds": inputs_embeds,
+                "attention_mask": attention_mask,
+                "cache_position": cache_position,
+                "past_key_values": past_key_values,
+                "position_ids": position_ids,
+            }
+            causal_mask_mapping = {
+                "full_attention": create_causal_mask(**mask_kwargs),
+            }
+            if self.has_sliding_layers:
+                causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+
+        hidden_states = inputs_embeds
+
+        # positional embeddings 
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+        for decoder_layer in self.layers[: self.config.num_hidden_layers]:# why is this check necessary? 
+            hidden_states = decoder_layer(
+                hidden_states,
+                attention_mask=causal_mask_mapping[decoder_layer.attention_type],
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )
+
+        hidden_states = self.norm(hidden_states)
+        hidden_states = self.output_proj(hidden_states)
+
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=past_key_values if use_cache else None,
+        )
+        
+
+
+
+# Till now tbd are cache-position and rope and still I am not sure what going inside this model? is it text or its audio ? 
+# ---------x---------
+
+# now the activation for decoder 
+class SnakeBeta(nn.Module):
+    ''''
+    This is used cause we want model to learn periodic functions ( this should be used for audio models as thats where we have this use case )
+
+    this is a  type of activation function 
+    Original snake function  : periodic function f(x) = x + 1/a * sin^2 (ax) , where a is a learnable parameter
+
+    Modified snake function : uses alpha and beta 
+    alpha for controlling frequency 
+    beta for controlling magnitude
+    
+    '''
+    def __init__(self, in_features, alpha=1.0):
+        self.in_features = in_features
+
+        self.alpha = nn.Parameter(torch.zeros(in_features) * alpha)
+        self.beta = nn.Parameter(torch.zeros(in_features) * alpha)
+        self.no_div_by_zero = 0.000000001
+
+
+    def forward(self, hidden_states):
+        alpha = self.alpha.unsqueeze(0).unsqueeze(-1) # line up with x to [B, C, T]
+        beta = self.beta.unsqueeze(0).unsqueeze(-1)
+        alpha = torch.exp(alpha)
+        beta = torch.exp(beta)
+        hidden_states = hidden_states + (1.0 / (beta + self.no_div_by_zero)) * torch.pow(torch.sin(hidden_states * alpha), 2)
+        return hidden_states
+
+
+# rseidual connection in decoder only 
+#what is this ? decoder residual unit ? what was decoder MLP then 
+class Qwen3SpeechTokenizerDecoderResidualUnit(nn.Module):
+    '''
+    This model is trying to learn the wave periodic functions that we use in audio models to learn the waveform
+    Here we are using conv net, so these hidden states should be of an audio model
+    '''
+    def __init__(self, dim: int = 16, dilation: int = 1):
+        super().__init__()
+        self.act1 = SnakeBeta(dim)
+        self.conv1 = Qwen3SpeechTokenizerCausalConvNet(dim, dim, kernel_size=7, dilation=dilation)
+        self.act2 = SnakeBeta(dim)
+        self.conv2 = Qwen3SpeechTokenizerCausalConvNet(dim, dim, kernel_size=1)
+
+    def forward(self, hidden_state):
+        residual = hidden_state
+        hidden_state = self.conv2(self.act2(self.conv1(self.act1(hidden_state))))
+        return hidden_state + residual
+
+
+
+# conv decoder block in decoder model  
+# decoder - decoder block ? bad naming convention at least till now , its completely unreadable 
+class Qwen3SpeechTokenizerDecoderDecoderBlock(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
+    def __init__(self, config: Qwen3TTSTokenizerV2DecoderConfig, layer_idx):
+        '''
+        architecture for this now looks like : 
+        activation , conv net , act , conv , act , conv , act , conv .. like this we have multiple layers for this 
+        '''
+        super().__init__(config)
+        in_dim = config.decoder_dim // 2**layer_idx
+        out_dim = config.decoder_dim // 2 ** (layer_idx + 1)
+        upsample_rate = config.upsample_rates[layer_idx]
+
+        block = [
+            SnakeBeta(in_dim),
+            Qwen3SpeechTokenizerCausalConvNet(in_dim, out_dim, kernel_size=2 * upsample_rate, stride=upsample_rate)
+        ]
+
+        for dilation in (1, 3, 9):
+            block.append(Qwen3SpeechTokenizerDecoderResidualUnit(out_dim, dilation))
+
+        self.block = nn.ModuleList(block)
+
+    def forward(self, hidden):
+        for block in self.block:
+            hidden = block(hidden)
+        return hidden
+
+'''
+Representation learning : to produce some efficient representation of underlying data like VAE , that learns continuous latent space or we can have Discrete latent space also  
+
+the discrete one is called vector quantization (VQ) mdoel where the codebooks are discrete  
+
+'''
+
+
+class EuclideanCodebook(nn.Module):
+    '''
+    Euclidean distance between 2 vectors 
+    Codebook are also learned using k means clustering , that is we take common vectors together we create a mean value for it , that is referred to as codebook and then we select nearest vector in euclidean space for same 
+    '''
+    def __init__(self, dim: int, codebook_size: int, epsilon: float = 1e-5):
+        super().__init__()
+        self.epsilon = epsilon
+        self.cluster_usage = nn.Parameter(torch.ones(codebook_size)) # 
+        self.embedding_sum = nn.Parameter(torch.zeros(codebook_size, dim)) # 
+
+    def decode(
+        self,
+        codes: torch.Tensor 
+    ):
+        embedding  = self.embedding_sum / self.cluster_usage.clamp(min=self.epsilon)[:, None]
+        quantized = F.embedding(codes, embedding)
+        return quantized
+        
+
+class VectorQuantization(nn.Module):
+    
+    def __init__(self, dim: int, codebook_size: int, codebook_dim: Optional[int] = None, epsilon: float = 1e-5):
+        super().__init__()
+        if codebook_dim is None:
+            codebook_dim = dim
+
+        requires_projection = codebook_dim != dim
+        self.project_out = nn.Linear(codebook_dim, dim) if requires_projection else nn.Identity()
+        self.epsilon = epsilon 
+        self._codebook = EuclideanCodebook(dim=codebook_dim, codebook_size=codebook_size, epsilon=epsilon)
+        self.codebook_size = codebook_size
+
+    def decode(self, codes: torch.Tensor) -> torch.Tensor:
+        quantized = self._codebook.decode(codes)
+        quantized = self.project_out(quantized)
+        quantized = quantized.transpose(1, 2)
+        return quantized
+
+class ResidualVectorQuantization(nn.Module):
+    def __init__(self, *, num_quantizers: int, **kwargs):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [VectorQuantization(**kwargs) for _ in range(num_quantizers)]
+        )
+    def decode(self, codes: torch.Tensor) -> torch.Tensor:
+        quantized = torch.zeros([1], device=codes.device)[0]
+        for idx, layer_codes in enumerate(codes):
+            layer = self.layers[idx]
+            assert isinstance(layer, VectorQuantization)
+            quantized = quantized + layer.decode(layer_codes)
+        return quantized
+
+# ---X--- 
+class ResidualVectorQuantizer(nn.Module):
+    def __init__(
+        self, 
+        dimension: int = 128,
+        input_dimension: Optional[int] = None,
+        output_dimension: Optional[int] = None,
+        n_q: int = 8,
+        q_dropout: bool = False,
+        no_quantization_rate: float = 0.0,
+        bins: int = 1024,
+        decay: float = 0.99,
+        force_projection: bool = False,
+    ):
+        super().__init__()
+        self.max_n_q = n_q
+        self.n_q = n_q
+        self.q_dropout = q_dropout
+        self.no_quantization_rate = no_quantization_rate
+        self.dimension = dimension
+        self.input_dimension = input_dimension or dimension
+        self.output_dimension = output_dimension or dimension
+        self.bins = bins
+        self.decay = decay
+        self.input_proj: torch.nn.Module
+        self.output_proj: torch.nn.Module
+        if self.input_dimension == self.dimension and not force_projection:
+            self.input_proj = torch.nn.Identity()
+        else:
+            self.input_proj = nn.Conv1d(self.input_dimension, self.dimension, 1, bias=False)
+        if self.output_dimension == self.dimension and not force_projection:
+            self.output_proj = torch.nn.Identity()
+        else:
+            self.output_proj = nn.Conv1d(self.dimension, self.output_dimension, 1, bias=False)
+        self.vq = ResidualVectorQuantization(
+            dim=self.dimension,
+            codebook_size=self.bins,
+            num_quantizers=self.n_q
+        )
+
+    def decode(self, codes: torch.Tensor) -> torch.Tensor:
+        codes = codes.transpose(0, 1)
+        quantized = self.vq.decode(codes)
+        quantized = self.output_proj(quantized)
+        return quantized
+     
+
+class SplitResidualVectorQuantizer(nn.Module):
+    pass
+
+
+
+# Final decoder model is yet to come --------x---------
 
 class Qwen3SpeechTokenizerStreaming(nn.Module):
     def __init__(self):
