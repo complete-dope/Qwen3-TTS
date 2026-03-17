@@ -729,7 +729,6 @@ class ResidualVectorQuantization(nn.Module):
             quantized = quantized + layer.decode(layer_codes)
         return quantized
 
-# --- X----
 class ResidualVectorQuantizer(nn.Module):
     def __init__(
         self,

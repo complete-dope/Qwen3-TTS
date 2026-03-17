@@ -4,13 +4,14 @@
 import torch
 import torch.nn as nn 
 import torch.nn.functional as F
-
+import numpy as np
 
 import math
 from dataclasses import dataclass 
 from typing import Optional, Union, List, Tuple, Dict, Any , Callable
 from transformers.processing_utils import Unpack
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
+from transformers import MimiModel, MimiConfig
 
 # wow xformers got so much new things!
 from transformers.activations import ACT2FN
@@ -127,6 +128,27 @@ class Qwen3SpeechTokenizerCausalConvNet(nn.Module):
         extra_padding = self._get_extra_padding_for_conv1d(hidden_state)
         hidden_state = F.pad(hidden_state , (self.padding, extra_padding), mode="constant", value=0)
         return self.conv(hidden_state).contiguous()
+
+# TDB later here we are doing causal / temporal conv 
+class Qwen3SpeechTokenizerCausalTransConvNet(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1):
+        super().__init__()
+        self.conv = nn.ConvTranspose1d(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+        )
+        # this is temporal convolution 
+        pad = kernel_size - stride # this is to ensure each pixel is preocesssed same no. of times (no partiality)
+        self.left_pad = 0
+        self.right_pad = int(pad)
+
+    def forward(self, hidden_state):
+        hidden_state = self.conv(hidden_state)
+        if self.right_pad > 0:
+            hidden_state = hidden_state[..., : hidden_state.shape[-1] - self.right_pad]
+        return hidden_state.contiguous()
 
 # residual connection + 1d conv block + depthwise conv (audio input)
 class Qwen3SpeechTokenizerConvNeXtBlock(nn.Module):
@@ -513,9 +535,13 @@ Representation learning : to produce some efficient representation of underlying
 
 the discrete one is called vector quantization (VQ) mdoel where the codebooks are discrete  
 
+* Vector Quantization : one codebook for vectors, closest prototype 
+
+* Residual Vector Quantization : greedy decomposition,  multiple codebooks and finding the most relevant one residual connections
+
 '''
 
-
+# In clustering also has now become an DL based problem
 class EuclideanCodebook(nn.Module):
     '''
     Euclidean distance between 2 vectors 
@@ -534,7 +560,7 @@ class EuclideanCodebook(nn.Module):
         embedding  = self.embedding_sum / self.cluster_usage.clamp(min=self.epsilon)[:, None]
         quantized = F.embedding(codes, embedding)
         return quantized
-        
+
 
 class VectorQuantization(nn.Module):
     
@@ -555,6 +581,7 @@ class VectorQuantization(nn.Module):
         quantized = quantized.transpose(1, 2)
         return quantized
 
+# multiple vector quantization layers with residual connection refers to this 
 class ResidualVectorQuantization(nn.Module):
     def __init__(self, *, num_quantizers: int, **kwargs):
         super().__init__()
@@ -569,7 +596,7 @@ class ResidualVectorQuantization(nn.Module):
             quantized = quantized + layer.decode(layer_codes)
         return quantized
 
-# ---X--- 
+
 class ResidualVectorQuantizer(nn.Module):
     def __init__(
         self, 
@@ -599,6 +626,7 @@ class ResidualVectorQuantizer(nn.Module):
             self.input_proj = torch.nn.Identity()
         else:
             self.input_proj = nn.Conv1d(self.input_dimension, self.dimension, 1, bias=False)
+
         if self.output_dimension == self.dimension and not force_projection:
             self.output_proj = torch.nn.Identity()
         else:
@@ -611,19 +639,211 @@ class ResidualVectorQuantizer(nn.Module):
 
     def decode(self, codes: torch.Tensor) -> torch.Tensor:
         codes = codes.transpose(0, 1)
-        quantized = self.vq.decode(codes)
-        quantized = self.output_proj(quantized)
+        quantized = self.vq.decode(codes) # vector quantization 
+        quantized = self.output_proj(quantized) # then passing that through 1d conv to get final values out from this 
         return quantized
      
 
 class SplitResidualVectorQuantizer(nn.Module):
-    pass
+    '''
+    here we are splitting vector quantization into two parts, one for semantic and one for acoustic 
+    so we are making 2 quantizer and both will serve different roles
+    '''
+    def __init__(
+        self,
+        *, 
+        n_q : int = 8,
+        n_q_semantic : int = 1,
+        **kwargs,
+    ):
+        super().__init__()
+        assert n_q > n_q_semantic, (
+            f"Number of quantizers {n_q} must be larger "
+            f"than the number of semantic quantizers {n_q_semantic}."
+        )
+        self.max_n_q = n_q
+        self.n_q_semantic = n_q_semantic
+        self.n_q_acoustic = n_q - n_q_semantic
+        q_dropout = kwargs.pop("q_dropout", False)
+        self.rvq_first = ResidualVectorQuantizer(
+            n_q=n_q_semantic, force_projection=True, q_dropout=False, **kwargs
+        )
+        self.rvq_rest = ResidualVectorQuantizer(
+            n_q=n_q - n_q_semantic,
+            force_projection=True,
+            q_dropout=q_dropout,
+            **kwargs,
+        )
+
+    def decode(self, codes: torch.Tensor) -> torch.Tensor:
+        quantized = self.rvq_first.decode(codes[:, : self.n_q_semantic])
+        if codes.shape[1] > self.n_q_semantic:
+            quantized += self.rvq_rest.decode(codes[:, self.n_q_semantic :])
+        return quantized
+
+# Final decoder model Arrived ! 
+class Qwen3TokenizerDecoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
+    def __init__(self, config: Qwen3TTSTokenizerV2DecoderConfig):
+        super().__init__(config)
+        self.total_upsample = np.prod(config.upsample_rates + config.upsampling_ratios) # product of all values in the array 
+        self.pre_transformer = Qwen3SpeechTokenizerDecoderTransformerModel._from_config(config)
+
+        self.quantizer = SplitResidualVectorQuantizer(
+            dimension=config.codebook_dim // 2,
+            n_q=config.num_quantizers,
+            n_q_semantic=1,
+            bins=config.codebook_size,
+            input_dimension=config.codebook_dim,
+            output_dimension=config.codebook_dim,
+        )
+        self.pre_conv = Qwen3SpeechTokenizerCausalConvNet(
+            config.codebook_dim,
+            config.latent_dim,
+            kernel_size=3,
+        )
+
+        upsample = []
+        for factor in config.upsampling_ratios:
+            upsample.append(
+                nn.ModuleList(
+                    [
+                        Qwen3SpeechTokenizerCausalTransConvNet(config.latent_dim, config.latent_dim, factor, factor),
+                        Qwen3SpeechTokenizerConvNeXtBlock(config.latent_dim),
+                    ]
+                )
+            )
+
+        self.upsample = nn.ModuleList(upsample)
+        decoder = [Qwen3SpeechTokenizerCausalConvNet(config.latent_dim, config.decoder_dim, 7)]
+
+        for i in range(len(config.upsample_rates)):
+            decoder.append(Qwen3SpeechTokenizerDecoderDecoderBlock(config, i))
+        output_dim = config.decoder_dim // 2 ** len(config.upsample_rates)
+        decoder += [
+            SnakeBeta(output_dim),
+            Qwen3SpeechTokenizerCausalConvNet(output_dim, 1, 7),
+        ]
+        self.decoder = nn.ModuleList(decoder)
+        self.post_init()
+
+    def forward(self, codes):
+        if codes.shape[1] != self.config.num_quantizers:
+            raise ValueError(f"Expected {self.config.num_quantizers} layer of codes, got {codes.shape[1]}")
+        
+        hidden = self.quantizer.decode(codes)
+        hidden = self.pre_conv(hidden).transpose(1, 2)
+        hidden = self.pre_transformer(inputs_embeds=hidden).last_hidden_state
+        hidden = hidden.permute(0, 2, 1)
+        for blocks in self.upsample:
+            for block in blocks:
+                hidden = block(hidden)
+
+# this decoder was for audio codes so all that we did was for audio dataset (this needs to be analysed mapped out fully)
+class Qwen3SpeechTokenizerEncoder(MimiModel):
+    def __init__(
+        self,
+        config: MimiConfig
+    ):
+        super().__init__(config)
+        self.config = config
+        self.upsample = None
+        self.decoder_transformer = None
+        self.decoder = None
+        self.post_init()
 
 
+@auto_docstring
+class Qwen3TTSTokenizerV2PreTrainedModel(PreTrainedModel):
+    config: Qwen3TTSTokenizerV2Config
+    base_model_prefix = "model"
+    supports_gradient_checkpointing = True
+    _skip_keys_device_placement = "past_key_values"
+    _supports_flash_attn = True
+    _supports_sdpa = True
+    _can_compile_fullgraph = False
+    _supports_attention_backend = True
 
-# Final decoder model is yet to come --------x---------
 
+class Qwen3TokenizerModel(Qwen3TTSTokenizerV2PreTrainedModel):
+    def __init__(
+        self, 
+        config: Qwen3TTSTokenizerV2Config
+    ):
+        super().__init__(config)
+        self.config = config
+        self.encoder_valid_num_quantizers = config.encoder_valid_num_quantizers
+        self.input_sample_rate = config.input_sample_rate
+        self.output_sample_rate = config.output_sample_rate
+        self.decode_upsample_rate = config.decode_upsample_rate
+        self.encode_downsample_rate = config.encode_downsample_rate
+
+
+        self.encoder = Qwen3SpeechTokenizerEncoder._from_config(config.encoder_config)
+        
+        self.decoder = Qwen3TokenizerDecoder._from_config(config.decoder_config)
+        self.post_init()
+        
+    def get_model_type(self):
+        return self.config.model_type
+    
+    def get_input_sample_rate(self):
+        return self.input_sample_rate
+    
+    def get_output_sample_rate(self):
+        return self.output_sample_rate
+    
+    def get_decode_upsample_rate(self):
+        return self.decode_upsample_rate
+    
+    def get_encode_downsample_rate(self):
+        return self.encode_downsample_rate
+    
+    def encode(
+        self, 
+        input_values: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[tuple[torch.Tensor, Optional[torch.Tensor]], Qwen3TTSTokenizerV2EncoderOutput]:
+
+        return_dict = return_dict if return_dict is not None else self.config.return_dict
+
+        encoded_frames = self.encoder.encode(
+            input_values=input_values.unsqueeze(1),
+            return_dict=True
+        ) # this outputs the audio frames / codes  
+
+        audio_codes = encoded_frames.audio_codes[:, :self.encoder_valid_num_quantizers]
+        audio_codes = [code[..., :-(-mask.sum() // self.encode_downsample_rate)].transpose(0, 1) for code, mask in zip(audio_codes, padding_mask)]
+        if not return_dict:
+            return (audio_codes,)
+        return Qwen3TTSTokenizerV2EncoderOutput(audio_codes)
+
+    def decode(
+        self, 
+        audio_codes:torch.Tensor, 
+        return_dict: Optional[bool] = None,
+    ) -> Union[tuple[torch.Tensor, Optional[torch.Tensor]], Qwen3TTSTokenizerV2DecoderOutput]:
+
+        return_dict = return_dict if return_dict is not None else self.config.return_dict
+    
+        audio_lengths = (audio_codes[..., 0] > -1).sum(1) * self.decode_upsample_rate
+    
+        audio_codes = torch.clamp(audio_codes, min=0)   
+        audio_values = self.decoder.chunked_decode(audio_codes.transpose(1, 2)).squeeze(1)
+
+        audio_values = [a[:l] for a, l in zip(audio_values, audio_lengths)]
+
+        if not return_dict:
+            return (audio_values,)
+        return Qwen3TTSTokenizerV2DecoderOutput(audio_values)
+
+__all__ = ["Qwen3TokenizerModel", "Qwen3TTSTokenizerV2PreTrainedModel"]
+
+
+# ---x----
+        
 class Qwen3SpeechTokenizerStreaming(nn.Module):
+
     def __init__(self):
         super().__init__()
 
