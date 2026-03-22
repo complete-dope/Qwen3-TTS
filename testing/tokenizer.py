@@ -19,6 +19,8 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.integrations import use_kernel_forward_from_hub
 from transformers.utils import auto_docstring
 from transformers.modeling_utils import PreTrainedModel
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
+
 from transformers.utils import ModelOutput, auto_docstring, logging
 from transformers.masking_utils import (
     create_causal_mask,
@@ -29,6 +31,41 @@ from transformers.modeling_outputs import BaseModelOutputWithPast
 
 
 from .tokenizer_configuration import Qwen3TTSTokenizerV2Config, Qwen3TTSTokenizerV2DecoderConfig
+
+
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    """Applies Rotary Position Embedding to the query and key tensors.
+
+    Args:
+        q (`torch.Tensor`): The query tensor.
+        k (`torch.Tensor`): The key tensor.
+        cos (`torch.Tensor`): The cosine part of the rotary embedding.
+        sin (`torch.Tensor`): The sine part of the rotary embedding.
+        position_ids (`torch.Tensor`, *optional*):
+            Deprecated and unused.
+        unsqueeze_dim (`int`, *optional*, defaults to 1):
+            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
+            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
+            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
+            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
+            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
+            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
+    Returns:
+        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
+    """
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
 
 # Utils for doing GQA 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -66,19 +103,19 @@ def eager_attention_forward(
 
 @dataclass
 @auto_docstring
-class Qwen3TTSTokenizerV2EncoderOutput(ModelOutput):
+class Qwen3TTSTokenizerEncoderOutput(ModelOutput):
     r"""
     audio_codes (`List[torch.LongTensor]`):
         Discret code embeddings computed using `model.encode`, each tensor has shape (codes_length_i, num_quantizers).
     """
 
-    audio_codes: List[torch.LongTensor] = None # encoder output is audio-codec
+    audio_codes: List[torch.LongTensor] = None # encoder output is audio-codes
     # [12 ,123,421, 41 , ... ]
 
 
 @dataclass
 @auto_docstring
-class Qwen3TTSTokenizerV2DecoderOutput(ModelOutput):
+class Qwen3TTSTokenizerDecoderOutput(ModelOutput):
     r"""
     audio_values (`List[torch.FloatTensor]`):
         Decoded audio values, obtained using the decoder part of Qwen3TTSTokenizerV1.
@@ -88,10 +125,8 @@ class Qwen3TTSTokenizerV2DecoderOutput(ModelOutput):
     audio_values: List[torch.FloatTensor] = None # decoder output is audio-value
     # [12.1 , 32.1 , 43.1 , 23.4 , ... ]
 
-
-
 @auto_docstring
-class Qwen3TTSTokenizerV2DecoderPreTrainedModel(PreTrainedModel):
+class Qwen3TTSTokenizerDecoderPreTrainedModel(PreTrainedModel):
     config: Qwen3TTSTokenizerV2DecoderConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
@@ -103,14 +138,17 @@ class Qwen3TTSTokenizerV2DecoderPreTrainedModel(PreTrainedModel):
 
 
 class Qwen3SpeechTokenizerCausalConvNet(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, dilation ,padding, stride=1):
+    def __init__(self, in_channels, out_channels, kernel_size, dilation=1, padding=None, stride=1, groups=1):
         super().__init__()
+        if padding is None:
+            padding = (kernel_size - 1) * dilation
         self.conv = nn.Conv1d(
             in_channels = in_channels, 
             out_channels = out_channels, 
             kernel_size = kernel_size, 
             stride = stride, 
-            dilation = dilation, # default goes to 1 
+            dilation = dilation,
+            groups = groups,
         )
         self.stride = stride
         self.kernel_size = (kernel_size-1) * dilation + 1 # (3-1)*2 + 1 -> leaving out one gap of dilation  
@@ -130,6 +168,7 @@ class Qwen3SpeechTokenizerCausalConvNet(nn.Module):
         return self.conv(hidden_state).contiguous()
 
 # TDB later here we are doing causal / temporal conv 
+# this is not causal BTW ... 
 class Qwen3SpeechTokenizerCausalTransConvNet(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, stride=1):
         super().__init__()
@@ -139,7 +178,7 @@ class Qwen3SpeechTokenizerCausalTransConvNet(nn.Module):
             kernel_size=kernel_size,
             stride=stride,
         )
-        # this is temporal convolution 
+        # this is temporal convolution as we used 
         pad = kernel_size - stride # this is to ensure each pixel is preocesssed same no. of times (no partiality)
         self.left_pad = 0
         self.right_pad = int(pad)
@@ -180,16 +219,57 @@ class Qwen3SpeechTokenizerConvNeXtBlock(nn.Module):
 
 # TBD later
 class Qwen3SpeechTokenizerDecoderRotaryEmbedding(nn.Module):
-    def __init__(self, dim:int) -> None:
+    def __init__(self, config , device=None) -> None:
+        super().__init__()
+        if hasattr(config , 'rope_scaling') and isinstance(config.rope_scaling, dict):
+            self.rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type"))
+        else:
+            self.rope_type = "default"
+
+        self.max_seq_len_cached = config.max_position_embeddings
+        self.original_max_seq_len = config.max_position_embeddings
+
+        self.config = config
+
+        if self.rope_type == "default":
+            inv_freq, self.attention_scaling = self.compute_default_rope_parameters(config, device)
+        else:
+            self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+            inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
+
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.original_inv_freq = self.inv_freq
+
+    def compute_default_rope_parameters(self, config=None, device=None):
+        cfg = config if config is not None else self.config
+        head_dim = getattr(cfg, "head_dim", None) or (cfg.hidden_size // cfg.num_attention_heads)
+        base = getattr(cfg, "rope_theta", 10000.0)
+        inv_freq = 1.0 / (
+            base ** (torch.arange(0, head_dim, 2, dtype=torch.int64).float() / head_dim)
+        )
+        if device is not None:
+            inv_freq = inv_freq.to(device)
+        return inv_freq, 1.0
+
+    
+    @torch.no_grad()
+    @dynamic_rope_update
+    def forward(self, x, position_ids):
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
+        position_ids_expanded = position_ids[:, None, :].float()
+
+        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos() * self.attention_scaling
+            sin = emb.sin() * self.attention_scaling
         
-        pass
+        return cos.to(dtype = x.dtype) , sin.to(dtype = x.dtype)
 
-    def forward(self):
-        pass
-
-# still not sure fully what goes in the input ( need to be tokens of some sort [audio or text]) as we are doing attention  
 class Qwen3SpeechTokenizerDecoderAttention(nn.Module):
     def __init__(self, config, layer_idx) -> None:
+        super().__init__()
         self.config = config
         self.layer_idx = layer_idx
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
@@ -346,7 +426,7 @@ class Qwen3SpeechTokenizerDecoderTransformerLayer(nn.Module):
 
 
 # this is one part of a decoder model , where we are using transformer 
-class Qwen3SpeechTokenizerDecoderTransformerModel(Qwen3TTSTokenizerV2DecoderPreTrainedModel): # TBD: what is this tokenizer decoder 
+class Qwen3SpeechTokenizerDecoderTransformerModel(Qwen3TTSTokenizerDecoderPreTrainedModel): # TBD: what is this tokenizer decoder 
     _can_record_outputs = {
         "hidden_states": Qwen3SpeechTokenizerDecoderTransformerLayer,
         "attentions": Qwen3SpeechTokenizerDecoderAttention,
@@ -358,7 +438,7 @@ class Qwen3SpeechTokenizerDecoderTransformerModel(Qwen3TTSTokenizerV2DecoderPreT
             [Qwen3SpeechTokenizerDecoderTransformerLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = Qwen3SpeechTokenizerDecoderRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = Qwen3SpeechTokenizerDecoderRotaryEmbedding(config.head_dim)
+        self.rotary_emb = Qwen3SpeechTokenizerDecoderRotaryEmbedding(config)
         self.gradient_checkpointing = False
         self.has_sliding_layers = "sliding_attention" in self.config.layer_types # in 2026 we are stil using sliding attention ? 
         self.window_size = config.sliding_window
@@ -381,7 +461,7 @@ class Qwen3SpeechTokenizerDecoderTransformerModel(Qwen3TTSTokenizerV2DecoderPreT
         cache_position=None,
         **kwargs,
 
-    ) -> Qwen3TTSTokenizerV2DecoderOutput:
+    ) -> Qwen3TTSTokenizerDecoderOutput:
         if input_ids is not None: # input_ids can never pass through this filter
             raise ValueError("input_ids is not expected")
         if (input_ids is None) ^ (inputs_embeds is not None): # xor operator
@@ -454,7 +534,7 @@ class Qwen3SpeechTokenizerDecoderTransformerModel(Qwen3TTSTokenizerV2DecoderPreT
 # now the activation for decoder 
 class SnakeBeta(nn.Module):
     ''''
-    This is used cause we want model to learn periodic functions ( this should be used for audio models as thats where we have this use case )
+    This is used cause we want model to learn periodic functions , like audio waveforms ( this should be used for audio models as thats where we have this use case )
 
     this is a  type of activation function 
     Original snake function  : periodic function f(x) = x + 1/a * sin^2 (ax) , where a is a learnable parameter
@@ -465,6 +545,7 @@ class SnakeBeta(nn.Module):
     
     '''
     def __init__(self, in_features, alpha=1.0):
+        super().__init__()
         self.in_features = in_features
 
         self.alpha = nn.Parameter(torch.zeros(in_features) * alpha)
@@ -480,7 +561,7 @@ class SnakeBeta(nn.Module):
         hidden_states = hidden_states + (1.0 / (beta + self.no_div_by_zero)) * torch.pow(torch.sin(hidden_states * alpha), 2)
         return hidden_states
 
-
+# hm seems like this is an audio tokenizer that we are working with 
 # rseidual connection in decoder only 
 #what is this ? decoder residual unit ? what was decoder MLP then 
 class Qwen3SpeechTokenizerDecoderResidualUnit(nn.Module):
@@ -504,7 +585,7 @@ class Qwen3SpeechTokenizerDecoderResidualUnit(nn.Module):
 
 # conv decoder block in decoder model  
 # decoder - decoder block ? bad naming convention at least till now , its completely unreadable 
-class Qwen3SpeechTokenizerDecoderDecoderBlock(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
+class Qwen3SpeechTokenizerDecoderDecoderBlock(Qwen3TTSTokenizerDecoderPreTrainedModel):
     def __init__(self, config: Qwen3TTSTokenizerV2DecoderConfig, layer_idx):
         '''
         architecture for this now looks like : 
@@ -517,7 +598,7 @@ class Qwen3SpeechTokenizerDecoderDecoderBlock(Qwen3TTSTokenizerV2DecoderPreTrain
 
         block = [
             SnakeBeta(in_dim),
-            Qwen3SpeechTokenizerCausalConvNet(in_dim, out_dim, kernel_size=2 * upsample_rate, stride=upsample_rate)
+            Qwen3SpeechTokenizerCausalTransConvNet(in_dim, out_dim, kernel_size=2 * upsample_rate, stride=upsample_rate)
         ]
 
         for dilation in (1, 3, 9):
@@ -539,6 +620,14 @@ the discrete one is called vector quantization (VQ) mdoel where the codebooks ar
 
 * Residual Vector Quantization : greedy decomposition,  multiple codebooks and finding the most relevant one residual connections
 
+How do we do vector quantization in this ? 
+https://www.youtube.com/watch?v=Xt9S74BHsvc
+So this should be more like an encoder decoder model where in the bottleneck part we are doing the vector quantization and its more like EnCodec model 
+
+* So residual vector quantization is just an recursive way of diving a space in smaller and smaller parts and this increases precision when constructing values back 
+
+* So more the interations , more codebooks we need to learn  
+so we get to this hyperparameter by deciding on our bitrate, so it best works like this, 12kbps bitrate results in 16 RVQ iterations and so on ...
 '''
 
 # In clustering also has now become an DL based problem
@@ -550,15 +639,15 @@ class EuclideanCodebook(nn.Module):
     def __init__(self, dim: int, codebook_size: int, epsilon: float = 1e-5):
         super().__init__()
         self.epsilon = epsilon
-        self.cluster_usage = nn.Parameter(torch.ones(codebook_size)) # 
-        self.embedding_sum = nn.Parameter(torch.zeros(codebook_size, dim)) # 
+        self.cluster_usage = nn.Parameter(torch.ones(codebook_size)) # initialized as all ones as all uniform   
+        self.embedding_sum = nn.Parameter(torch.zeros(codebook_size, dim)) # initialized as all zeros  
 
     def decode(
         self,
         codes: torch.Tensor 
     ):
         embedding  = self.embedding_sum / self.cluster_usage.clamp(min=self.epsilon)[:, None]
-        quantized = F.embedding(codes, embedding)
+        quantized = F.embedding(codes, embedding) # this just creates a look up for the indices that are in the codes and picks those up from the embedding matrix   
         return quantized
 
 
@@ -588,6 +677,7 @@ class ResidualVectorQuantization(nn.Module):
         self.layers = nn.ModuleList(
             [VectorQuantization(**kwargs) for _ in range(num_quantizers)]
         )
+
     def decode(self, codes: torch.Tensor) -> torch.Tensor:
         quantized = torch.zeros([1], device=codes.device)[0]
         for idx, layer_codes in enumerate(codes):
@@ -648,6 +738,8 @@ class SplitResidualVectorQuantizer(nn.Module):
     '''
     here we are splitting vector quantization into two parts, one for semantic and one for acoustic 
     so we are making 2 quantizer and both will serve different roles
+    So we are making 2 codebooks and each of those have seperate meaning in this we are doing semantic and acoustic quantization  
+    
     '''
     def __init__(
         self,
@@ -682,7 +774,7 @@ class SplitResidualVectorQuantizer(nn.Module):
         return quantized
 
 # Final decoder model Arrived ! 
-class Qwen3TokenizerDecoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
+class Qwen3TokenizerDecoder(Qwen3TTSTokenizerDecoderPreTrainedModel):
     def __init__(self, config: Qwen3TTSTokenizerV2DecoderConfig):
         super().__init__(config)
         self.total_upsample = np.prod(config.upsample_rates + config.upsampling_ratios) # product of all values in the array 
@@ -739,6 +831,7 @@ class Qwen3TokenizerDecoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
                 hidden = block(hidden)
 
 # this decoder was for audio codes so all that we did was for audio dataset (this needs to be analysed mapped out fully)
+# in encoder we are doing nothing .. we are using all from the mimi model  
 class Qwen3SpeechTokenizerEncoder(MimiModel):
     def __init__(
         self,
@@ -750,6 +843,9 @@ class Qwen3SpeechTokenizerEncoder(MimiModel):
         self.decoder_transformer = None
         self.decoder = None
         self.post_init()
+
+# mimi is a neural audio codec model with for speech representation and compression , operates at 1.1 kbps bitrate with a 12hz frame rate and has 16 RVQ ( more on this a bit later but we have an overall idea now)
+# human has 39 bps
 
 
 @auto_docstring
@@ -803,7 +899,7 @@ class Qwen3TokenizerModel(Qwen3TTSTokenizerV2PreTrainedModel):
         input_values: torch.Tensor,
         padding_mask: Optional[torch.Tensor] = None,
         return_dict: Optional[bool] = None,
-    ) -> Union[tuple[torch.Tensor, Optional[torch.Tensor]], Qwen3TTSTokenizerV2EncoderOutput]:
+    ) -> Union[tuple[torch.Tensor, Optional[torch.Tensor]], Qwen3TTSTokenizerEncoderOutput]:
 
         return_dict = return_dict if return_dict is not None else self.config.return_dict
 
@@ -816,13 +912,13 @@ class Qwen3TokenizerModel(Qwen3TTSTokenizerV2PreTrainedModel):
         audio_codes = [code[..., :-(-mask.sum() // self.encode_downsample_rate)].transpose(0, 1) for code, mask in zip(audio_codes, padding_mask)]
         if not return_dict:
             return (audio_codes,)
-        return Qwen3TTSTokenizerV2EncoderOutput(audio_codes)
+        return Qwen3TTSTokenizerEncoderOutput(audio_codes)
 
     def decode(
         self, 
         audio_codes:torch.Tensor, 
         return_dict: Optional[bool] = None,
-    ) -> Union[tuple[torch.Tensor, Optional[torch.Tensor]], Qwen3TTSTokenizerV2DecoderOutput]:
+    ) -> Union[tuple[torch.Tensor, Optional[torch.Tensor]], Qwen3TTSTokenizerDecoderOutput]:
 
         return_dict = return_dict if return_dict is not None else self.config.return_dict
     
@@ -835,84 +931,7 @@ class Qwen3TokenizerModel(Qwen3TTSTokenizerV2PreTrainedModel):
 
         if not return_dict:
             return (audio_values,)
-        return Qwen3TTSTokenizerV2DecoderOutput(audio_values)
+        return Qwen3TTSTokenizerDecoderOutput(audio_values)
 
 __all__ = ["Qwen3TokenizerModel", "Qwen3TTSTokenizerV2PreTrainedModel"]
-
-
-# ---x----
-        
-class Qwen3SpeechTokenizerStreaming(nn.Module):
-
-    def __init__(self):
-        super().__init__()
-
-        pass 
-
-class Qwen3SpeechTokenizerGeneratorAcousticCodebook(nn.Module):
-    def __init__(self):
-        ''''employs a 15-layer residual vector quantization (RVQ) module
-        '''
-        super().__init__()
-        self.acoustic_model = ...  # 15-layer residual vector quantization (RVQ) module 
-
-    def forward(self, waveform: torch.Tensor) -> torch.Tensor:
-        return self.acoustic_codebook(waveform)
-
-class Qwen3SpeechTokenizerGenerator(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.semantic_codebook = nn.Embedding(num_embeddings=1024, embedding_dim=1024)
-        self.acoustic_codebook = nn.Embedding(num_embeddings=32, embedding_dim=1024)
-
-        self.wavLM  = ... # model from microsoft and that acts as a teacher and is used to generate the semantic codebook values 
-
-    def forward(self, text) -> tuple[torch.Tensor, torch.Tensor]:
-        '''
-        text : (B, T_text)
-        2 discrete code sequences : semantic codebook and acoustic codebook modelling acoustic details, prosody etc 
-        '''
-
-        return self.semantic_codebook(text), self.acoustic_codebook(text)
-
-class Qwen3SpeechTokenizer(nn.Module):
-    ''''   
-    Gan based training framework , containing generator and discriminator  
-    generator operates directly on raw waveforms to extract and quantize both representations, while the discriminator improves the naturalness and fidelity of reconstructed speech.
-    '''
-    def __init__(self):
-        super().__init__()
-
-        self.generator =  Qwen3SpeechTokenizerGenerator()# input waveform 
-        self.discriminator = ... # TODO : what about this ? 
-
-
-    def forward(self, waveform: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-
-        self.generator(waveform)
-
-        return 
-
-reconstruction_loss = F.mse_loss(waveform, self.generator(waveform))
-
-tokenizer_loss = reconstruction_loss 
-
-# load the weights from huggingface model 
-
-
-class Qwen3TextTokenizer(nn.Module):
-    ''''
-    Same as the text LLM one, used in qwen gpt models 
-    '''
-    pass
-
-
-class SpeakerEncoder(nn.Module):
-    ''''
-    jointly trained ( with whom ?), a learnable speaker encoder with the backbone 
-    '''
-    def __init__(self):
-        super().__init__()
-        self.backbone = ... # TODO
-        pass
 

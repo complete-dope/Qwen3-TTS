@@ -91,7 +91,7 @@ def download_weights_from_hf_specific(
         )
     return hf_folder
 
-
+# SPEAKER MODEL UTILS 
 class Res2NetBlock(torch.nn.Module):
     def __init__(self, in_channels, out_channels, scale=8, kernel_size=3, dilation=1):
         super().__init__()
@@ -307,7 +307,7 @@ class SqueezeExcitationRes2NetBlock(nn.Module):
 
         return hidden_state + residual
 
-
+# SPEAKER ENCODER MODEL ! 
 class Qwen3TTSSpeakerEncoder(torch.nn.Module):
     """An implementation of the speaker embedding model in a paper.
     "ECAPA-TDNN: Emphasized Channel Attention, Propagation and Aggregation in
@@ -463,7 +463,7 @@ def mel_spectrogram(
 
     return mel_spec
 
-
+# TALKER MODEL UTILS
 class Qwen3TTSPreTrainedModel(PreTrainedModel):
     config_class = Qwen3TTSConfig
     base_model_prefix = "model"
@@ -557,6 +557,7 @@ class Qwen3TTSTalkerRotaryEmbedding(nn.Module):
             sin = emb.sin() * self.attention_scaling
 
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+ 
 
 class Qwen3TTSRotaryEmbedding(nn.Module):
     def __init__(self, config: Qwen3TTSConfig, device=None):
@@ -1344,7 +1345,6 @@ class Qwen3TTSTalkerOutputWithPast(ModelOutput):
     trailing_text_hidden: Optional[torch.FloatTensor] = None
     tts_pad_embed: Optional[torch.FloatTensor] = None
 
-
 class Qwen3TTSTalkerDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -1423,7 +1423,7 @@ class Qwen3TTSTalkerDecoderLayer(GradientCheckpointingLayer):
 
         return outputs
 
-
+# TALKER DECODER MODEL 
 class Qwen3TTSTalkerModel(Qwen3TTSTalkerTextPreTrainedModel):
     config_class = Qwen3TTSTalkerConfig
     base_model_prefix = "talker.model"
@@ -1809,7 +1809,7 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
         model_kwargs["tts_pad_embed"] = outputs.tts_pad_embed
         return model_kwargs
 
-
+# FINAL COMPLETE MODEL FOR CONDITIONAL GENERATION
 class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin):
     config_class = Qwen3TTSConfig
 

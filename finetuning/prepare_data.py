@@ -46,7 +46,7 @@ def main():
         batch_audios.append(line['audio'])
 
         if len(batch_lines) >= BATCH_INFER_NUM:
-            enc_res = tokenizer_12hz.encode(batch_audios)
+            enc_res = tokenizer_12hz.encode(batch_audios) # encode method from tokenizer model 
             for code, line in zip(enc_res.audio_codes, batch_lines):
                 line['audio_codes'] = code.cpu().tolist()
                 final_lines.append(line)
