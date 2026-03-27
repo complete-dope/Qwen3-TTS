@@ -1,3 +1,7 @@
+# here we are not sending any txt / prompt to the tokenizer 
+
+# ---x---
+
 # coding=utf-8
 # Copyright 2026 The Alibaba Qwen team.
 # SPDX-License-Identifier: Apache-2.0
@@ -25,6 +29,10 @@ import soundfile as sf
 import torch
 from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoConfig, AutoFeatureExtractor, AutoModel
+import sys 
+import os 
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ..core import (
     Qwen3TTSTokenizerV1Config,
@@ -204,6 +212,7 @@ class Qwen3TTSTokenizer:
                 a = librosa.resample(y=a.astype(np.float32), orig_sr=int(sr), target_sr=target_sr)
             out.append(a.astype(np.float32))
         return out
+# here we are making sampling rate same but we are not doing the audio duration as same right ?  maybe that we already have in data ? or we use padding for it ? 
 
     def encode(
         self,

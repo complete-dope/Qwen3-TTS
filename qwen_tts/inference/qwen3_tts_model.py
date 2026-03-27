@@ -17,9 +17,9 @@ import base64
 import io
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import /Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse
-
+from typing import Any, Dict, List, Optional, Tuple, Union
 import librosa
 import numpy as np
 import soundfile as sf
@@ -275,6 +275,7 @@ class Qwen3TTSModel:
     def _build_instruct_text(self, instruct: str) -> str:
         return f"<|im_start|>user\n{instruct}<|im_end|>\n"
 
+    # tokenizer text model generation 
     def _tokenize_texts(self, texts: List[str]) -> List[torch.Tensor]:
         input_ids = []
         for text in texts:

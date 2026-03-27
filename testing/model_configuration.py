@@ -390,6 +390,7 @@ class Qwen3TTSTalkerConfig(PretrainedConfig):
         attention_dropout=0,
         num_code_groups=32,
         text_hidden_size=2048,
+        text_vocab_size=151936,
         codec_eos_token_id=4198,
         codec_think_id=4202,
         codec_nothink_id=4203,
@@ -439,15 +440,20 @@ class Qwen3TTSTalkerConfig(PretrainedConfig):
             self.code_predictor_config = Qwen3TTSTalkerCodePredictorConfig(**code_predictor_config)
         self.num_code_groups = num_code_groups
         self.text_hidden_size = text_hidden_size
+        self.text_vocab_size = text_vocab_size
         self.codec_eos_token_id = codec_eos_token_id
         self.codec_think_id = codec_think_id
-        self.codec_language_id = codec_language_id
+        self.codec_language_id = codec_language_id if codec_language_id is not None else {
+            "chinese": 2055, "english": 2050, "german": 2053, "italian": 2070,
+            "portuguese": 2071, "spanish": 2054, "japanese": 2058, "korean": 2064,
+            "french": 2061, "russian": 2069,
+        }
         self.codec_nothink_id = codec_nothink_id
         self.codec_think_bos_id = codec_think_bos_id
         self.codec_think_eos_id = codec_think_eos_id
         self.codec_pad_id = codec_pad_id
         self.codec_bos_id = codec_bos_id
-        self.spk_id = spk_id
+        self.spk_id = spk_id if spk_id is not None else {}
         self.spk_is_dialect = spk_is_dialect
 
 

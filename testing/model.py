@@ -25,6 +25,8 @@ Talker and speaker seperation is required to differentiate from 'what' its sayin
 
 '''
 
+import sys
+sys.path.insert(0, '/Users/mohitdulani/Desktop/personal/audio-models/Qwen3-TTS')
 
 # qwen tts model 
 import torch 
@@ -42,13 +44,13 @@ from transformers.generation import GenerationMixin
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_utils import (PreTrainedModel, ALL_ATTENTION_FUNCTIONS)
 from transformers.modeling_rope_utils import (ROPE_INIT_FUNCTIONS, dynamic_rope_update)
-from transformers.utils import use_kernel_forward_from_hub
-from .model_configuration import Qwen3TTSSpeakerEncoderConfig 
-from .model_configuration import Qwen3TTSConfig , Qwen3TTSSpeakerEncoderConfig , Qwen3TTSTalkerCodePredictorConfig , Qwen3TTSTalkerConfig
+from transformers.integrations import use_kernel_forward_from_hub
+from testing.model_configuration import Qwen3TTSSpeakerEncoderConfig 
+from testing.model_configuration import Qwen3TTSConfig , Qwen3TTSSpeakerEncoderConfig , Qwen3TTSTalkerCodePredictorConfig , Qwen3TTSTalkerConfig
 from transformers.activations import ACT2FN
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import ModelOutput
-import logging 
+from transformers.utils import logging
 from transformers.masking_utils import (create_causal_mask,
                                         create_sliding_window_causal_mask)
 
@@ -361,7 +363,7 @@ class Qwen3TTSSpeakerEncoder(nn.Module):
 def dynamic_range_compression_torch(x, C=1, clip_val=1e-5):
     return torch.log(torch.clamp(x, min=clip_val) * C)
 
-def mel_spectogram(
+def mel_spectrogram(
     y: torch.Tensor, 
     n_fft: int, 
     num_mels: int,
@@ -491,7 +493,7 @@ class Qwen3TTSTalkerTextPreTrainedModel(PreTrainedModel):
             module.weight.data.fill_(1.0)
 
 class Qwen3TTSTalkerRotaryEmbedding(nn.Module):
-    def __init__(self, config:Qwen3TTSConfig, device = None):
+    def __init__(self, config: Qwen3TTSTalkerConfig, device=None):
         super().__init__()
 
         if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
@@ -511,23 +513,24 @@ class Qwen3TTSTalkerRotaryEmbedding(nn.Module):
     @torch.no_grad()
     @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
     def forward(self, x, position_ids):
-        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
-        position_ids_expanded = position_ids[:, None, :].float()
+        # In contrast to other models, Qwen3TTSThinkerText has different position ids for the grids
+        # So we expand the inv_freq to shape (3, ...)
+        inv_freq_expanded = self.inv_freq[None, None, :, None].float().expand(3, position_ids.shape[1], -1, 1)
+        position_ids_expanded = position_ids[:, :, None, :].float()  # shape (3, bs, 1, positions)
 
         device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
         with torch.autocast(device_type=device_type, enabled=False):  # Force float32
-            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(2, 3)
             emb = torch.cat((freqs, freqs), dim=-1)
             cos = emb.cos() * self.attention_scaling
             sin = emb.sin() * self.attention_scaling
 
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
-# so the problem with rope is its the freq are trained for a certain length only so once we go past that we the freq becomes very fast moving and attentions starts to break so for that we nede to do dynamic attention  
-class Qwen3RotaryEmbedding(nn.Module):
-    def __init__(self, config:Qwen3TTSConfig, device = None):
+# so the problem with rope is its the freq are trained for a certain length only so once we go past that we the freq becomes very fast moving and attentions starts to break so for that we nede to do dynamic attention
+class Qwen3TTSRotaryEmbedding(nn.Module):
+    def __init__(self, config: Qwen3TTSConfig, device=None):
         super().__init__()
-
         if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
             self.rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type"))
         else:
@@ -786,10 +789,7 @@ class Qwen3TTSTalkerCodePredictorOutputWithPast(ModelOutput):
     past_key_values: Optional[list[torch.FloatTensor]] = None
     hidden_states: Optional[tuple[torch.FloatTensor]] = None
     attentions: Optional[tuple[torch.FloatTensor]] = None
-    past_hidden: Optional[torch.FloatTensor] = None
-    generation_step: Optional[int] = None
-    trailing_text_hidden: Optional[torch.FloatTensor] = None
-    tts_pad_embed: Optional[torch.FloatTensor] = None
+    generation_steps: Optional[int] = None
 
 # talker code predictor : predicting code ? code refers to audio codec tokens 
 
@@ -957,21 +957,21 @@ class Qwen3TTSTalkerCodePredictorModel(Qwen3TTSPreTrainedModel):
     config_class = Qwen3TTSTalkerCodePredictorConfig
     base_model_prefix = "talker.code_predictor.model"
 
-    def __init__(self, config: Qwen3TTSTalkerCodePredictorConfig, talker_hidden_size: int = None):
+    def __init__(self, config: Qwen3TTSTalkerCodePredictorConfig, embedding_dim: int):
         super().__init__(config)
-        self.config = config
-        _embed_dim = talker_hidden_size if talker_hidden_size is not None else config.hidden_size
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
         self.layers = nn.ModuleList(
             [Qwen3TTSDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
-        ) # added decoder layers 
+        )  # added decoder layers
 
         self.norm = Qwen3TTSRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = Qwen3TTSTalkerRotaryEmbedding(config=config)
+        self.rotary_emb = Qwen3TTSRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
         self.has_sliding_layers = "sliding_attention" in self.config.layer_types
         self.codec_embedding = nn.ModuleList(
-            [nn.Embedding(config.vocab_size, _embed_dim) for _ in range(config.num_code_groups - 1)]
-        ) # added codec embedding 
+            [nn.Embedding(config.vocab_size, embedding_dim) for _ in range(config.num_code_groups - 1)]
+        )  # added codec embedding
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1016,7 +1016,7 @@ class Qwen3TTSTalkerCodePredictorModel(Qwen3TTSPreTrainedModel):
                 use_cache = False
 
         if use_cache and past_key_values is None:
-            past_key_values = DynamicCache(config=self.config)
+            past_key_values = DynamicCache()
 
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -1034,7 +1034,6 @@ class Qwen3TTSTalkerCodePredictorModel(Qwen3TTSPreTrainedModel):
                 "attention_mask": attention_mask,
                 "cache_position": cache_position,
                 "past_key_values": past_key_values,
-                "position_ids": position_ids,
             }
             causal_mask_mapping = {
                 "full_attention": create_causal_mask(**mask_kwargs),
@@ -1086,6 +1085,7 @@ class Qwen3TTSTalkerCodePredictorModel(Qwen3TTSPreTrainedModel):
 
 
 # conditional generation rest all is same ( so we are generating something conditional here )
+# mini generation for subsequent codes-generation  
 class Qwen3TTSTalkerCodePredictorModelForConditionalGeneration(Qwen3TTSPreTrainedModel , GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
     _tp_plan = {"lm_head": "colwise_rep"}
@@ -1095,7 +1095,7 @@ class Qwen3TTSTalkerCodePredictorModelForConditionalGeneration(Qwen3TTSPreTraine
 
     def __init__(self, config: Qwen3TTSTalkerCodePredictorConfig, talker_config: Qwen3TTSTalkerConfig):
         super().__init__(config)
-        self.model = Qwen3TTSTalkerCodePredictorModel(config, talker_hidden_size=talker_config.hidden_size)
+        self.model = Qwen3TTSTalkerCodePredictorModel(config, talker_config.hidden_size)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.ModuleList(
             [nn.Linear(config.hidden_size, config.vocab_size, bias=False) for _ in range(config.num_code_groups - 1)]
@@ -1183,6 +1183,62 @@ class Qwen3TTSTalkerCodePredictorModelForConditionalGeneration(Qwen3TTSPreTraine
             attentions=outputs.attentions,
         )
 
+    @can_return_tuple
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        labels=None,
+        use_cache=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        cache_position=None,
+        generation_steps=None,
+        **kwargs,
+    ):
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+
+        if inputs_embeds is not None and inputs_embeds.shape[1] > 1:
+            generation_steps = inputs_embeds.shape[1] - 2  # hidden & layer 0
+        else:
+            inputs_embeds = self.model.get_input_embeddings()[generation_steps - 1](input_ids)
+        inputs_embeds = self.small_to_mtp_projection(inputs_embeds)
+
+        outputs: BaseModelOutputWithPast = self.model(
+            input_ids=None,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            cache_position=cache_position,
+            **kwargs,
+        )
+
+        hidden_states = outputs.last_hidden_state
+        logits = self.lm_head[generation_steps](hidden_states)
+
+        loss = None
+        if labels is not None:
+            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+
+        return Qwen3TTSTalkerCodePredictorOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            generation_steps=generation_steps + 1,
+        )
+
     def _update_model_kwargs_for_generation(self, outputs, model_kwargs, is_encoder_decoder=False, num_new_tokens=1):
         model_kwargs = super()._update_model_kwargs_for_generation(
             outputs, model_kwargs, is_encoder_decoder, num_new_tokens
@@ -1198,8 +1254,8 @@ class Qwen3TTSTalkerOutputWithPast(ModelOutput):
     past_key_values: Optional[list[torch.FloatTensor]] = None
     hidden_states: Optional[tuple[torch.FloatTensor]] = None
     attentions: Optional[tuple[torch.FloatTensor]] = None
-    generation_steps: Optional[int] = None
     past_hidden: Optional[torch.FloatTensor] = None
+    generation_step: Optional[int] = None
     trailing_text_hidden: Optional[torch.FloatTensor] = None
     tts_pad_embed: Optional[torch.FloatTensor] = None
 
@@ -1260,22 +1316,23 @@ class Qwen3TTSTalkerDecoderLayer(GradientCheckpointingLayer):
 # FINAL TALKER MODEL 
 class Qwen3TTSTalkerModel(Qwen3TTSTalkerTextPreTrainedModel):
     config_class = Qwen3TTSTalkerConfig
-    base_model_prefix = "talker"
+    base_model_prefix = "talker.model"
 
     def __init__(self, config: Qwen3TTSTalkerConfig):
         super().__init__(config)
-        self.config = config
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
         self.layers = nn.ModuleList(
             [Qwen3TTSTalkerDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = Qwen3TTSRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = Qwen3TTSTalkerRotaryEmbedding(config=config)
+        self.rotary_emb = Qwen3TTSTalkerRotaryEmbedding(config)
 
-        self.gradient_checkpointing = False # so we are not storing the forward and backward pass for the models and are rather willing to recompute that from scratch 
+        self.gradient_checkpointing = False  # so we are not storing the forward and backward pass for the models and are rather willing to recompute that from scratch
 
         self.codec_embedding = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.text_embedding = nn.Embedding(config.text_vocab_size , config.text_hidden_size)
-        
+        self.text_embedding = nn.Embedding(config.text_vocab_size, config.text_hidden_size)
+
         self.post_init()
 
     def get_input_embeddings(self):
@@ -1296,12 +1353,12 @@ class Qwen3TTSTalkerModel(Qwen3TTSTalkerTextPreTrainedModel):
         past_key_values=None, 
         inputs_embeds=None, 
         use_cache=None, 
-        output_attentions=None, 
+        output_attentions=None, # which type of attention to use in this 
         output_hidden_states=None, 
         cache_position=None, 
         **kwargs
     ):
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions # eager / flash 
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
@@ -1318,7 +1375,7 @@ class Qwen3TTSTalkerModel(Qwen3TTSTalkerTextPreTrainedModel):
                 use_cache = False
 
         if use_cache and past_key_values is None:
-            past_key_values = DynamicCache(config=self.config)
+            past_key_values = DynamicCache()
 
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -1358,14 +1415,14 @@ class Qwen3TTSTalkerModel(Qwen3TTSTalkerTextPreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
 
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+        for decoder_layer in self.layers:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
             layer_outputs = decoder_layer(
-                hidden_states, 
+                hidden_states,
                 attention_mask=causal_mask,
-                position_ids=position_ids,
+                position_ids=text_position_ids,
                 past_key_values=past_key_values,
                 output_attentions=output_attentions,
                 use_cache=use_cache,
@@ -1383,9 +1440,9 @@ class Qwen3TTSTalkerModel(Qwen3TTSTalkerTextPreTrainedModel):
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-        return Qwen3TTSTalkerOutputWithPast(
+        return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
-            past_key_values=past_key_values if use_cache else None,
+            past_key_values=past_key_values,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
         )
@@ -1402,11 +1459,11 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
         self.model = Qwen3TTSTalkerModel(config)
         self.vocab_size = config.vocab_size
         self.text_projection = Qwen3TTSTalkerResizeMLP(
-            config.hidden_size, 
-            config.text_hidden_size, 
-            config.hidden_size, 
-            config.hidden_act, 
-            bias=True
+            config.text_hidden_size,
+            config.text_hidden_size,
+            config.hidden_size,
+            config.hidden_act,
+            bias=True,
         )
         self.codec_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False) # projection from hidden size to the vocab size 
         self.code_predictor = Qwen3TTSTalkerCodePredictorModelForConditionalGeneration(
@@ -1471,25 +1528,26 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
 
     @can_return_tuple
     def forward(
-        self, 
-        input_ids=None, 
-        attention_mask=None, 
-        position_ids=None, 
-        past_key_values=None, 
-        inputs_embeds=None, 
-        use_cache=None, 
-        output_attentions=None, 
-        output_hidden_states=None, 
-        cache_position=None, 
-        past_hidden = None, 
-        trailing_text_hidden = None, 
-        tts_pad_embed = None, 
-        generation_step = None, 
-        subtalker_dosample = None, 
-        subtalker_top_p = None, 
-        subtalker_top_k = None, 
-        subtalker_temperature = None, 
-        **kwargs
+        self,
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        labels=None,
+        use_cache=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        cache_position=None,
+        past_hidden=None,
+        trailing_text_hidden=None,
+        tts_pad_embed=None,
+        generation_step=None,
+        subtalker_dosample=None,
+        subtalker_top_p=None,
+        subtalker_top_k=None,
+        subtalker_temperature=None,
+        **kwargs,
     ):
         if inputs_embeds is not None and inputs_embeds.shape[1] > 1:
             generation_step = -1 
@@ -1559,18 +1617,19 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
         logits = self.codec_head(hidden_states)
 
         loss = None
-        if codec_ids is not None:
-            loss = self.loss_function(logits=logits, labels=codec_ids, vocab_size=self.vocab_size, **kwargs)
-        
+        if labels is not None:
+            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.vocab_size, **kwargs)
+
         return Qwen3TTSTalkerOutputWithPast(
-            loss = loss , 
-            logits = logits,
-            past_key_values = outputs.past_key_values,
-            hidden_states = outputs.hidden_states,
-            attentions = outputs.attentions,
-            generation_step = generation_step + 1,
-            trailing_text_hidden = trailing_text_hidden,
-            tts_pad_embed = tts_pad_embed,
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=(outputs.hidden_states, codec_ids),
+            attentions=outputs.attentions,
+            past_hidden=hidden_states[:, -1:, :],
+            generation_step=generation_step + 1,
+            trailing_text_hidden=trailing_text_hidden,
+            tts_pad_embed=tts_pad_embed,
         )
 
     def get_rope_index(
@@ -1659,12 +1718,11 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         weights_only=True,
         **kwargs,
     ):
-        # Hotfix to enable passing the correct attn implementation which is stored in the config but not in kwargs
         requested_attn_implementation = kwargs.pop("attn_implementation", None)
         if requested_attn_implementation is None and config and config._attn_implementation:
             requested_attn_implementation = config._attn_implementation
 
-        model = super().from_pretrained(
+        return super().from_pretrained(
             pretrained_model_name_or_path,
             *model_args,
             config=config,
@@ -1679,54 +1737,6 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             attn_implementation=requested_attn_implementation,
             **kwargs,
         )
-        if not local_files_only and not os.path.isdir(pretrained_model_name_or_path):
-            download_cache_dir = kwargs.get("cache_dir", cache_dir)
-            download_revision = kwargs.get("revision", revision)
-            download_weights_from_hf_specific(
-                pretrained_model_name_or_path,
-                cache_dir=download_cache_dir,
-                allow_patterns=["speech_tokenizer/*"],
-                revision=download_revision,
-            )
-        speech_tokenizer_path = cached_file(
-            pretrained_model_name_or_path,
-            "speech_tokenizer/config.json",
-            subfolder=kwargs.pop("subfolder", None),
-            cache_dir=kwargs.pop("cache_dir", None),
-            force_download=kwargs.pop("force_download", False),
-            proxies=kwargs.pop("proxies", None),
-            resume_download=kwargs.pop("resume_download", None),
-            local_files_only=kwargs.pop("local_files_only", False),
-            token=kwargs.pop("use_auth_token", None),
-            revision=kwargs.pop("revision", None),
-        )
-        if speech_tokenizer_path is None:
-            raise ValueError(f"""{pretrained_model_name_or_path}/{speech_tokenizer_path} not exists""")
-        speech_tokenizer_dir = os.path.dirname(speech_tokenizer_path)
-        speech_tokenizer = Qwen3TTSTokenizer.from_pretrained(
-            speech_tokenizer_dir,
-            *model_args,
-            **kwargs,
-        )
-        model.load_speech_tokenizer(speech_tokenizer)
-
-        generate_config_path = cached_file(
-            pretrained_model_name_or_path,
-            "generation_config.json",
-            subfolder=kwargs.pop("subfolder", None),
-            cache_dir=kwargs.pop("cache_dir", None),
-            force_download=kwargs.pop("force_download", False),
-            proxies=kwargs.pop("proxies", None),
-            resume_download=kwargs.pop("resume_download", None),
-            local_files_only=kwargs.pop("local_files_only", False),
-            token=kwargs.pop("use_auth_token", None),
-            revision=kwargs.pop("revision", None),
-        )
-        with open(generate_config_path, "r", encoding="utf-8") as f:
-            generate_config = json.load(f)
-        model.load_generate_config(generate_config)
-
-        return model
     
     @torch.inference_mode()
     def extract_speaker_embedding(self, audio, sr):
@@ -1765,7 +1775,8 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         tts_eos_embed: torch.Tensor,
         non_streaming_mode: bool,
     ):
-        # text embed (ref id + text id + eos) 1 T1 D
+        # text embed (ref id + text id + eos) 1 T1 
+        # we are passing these text tokens and this projects in hidden state that we are passing to talker model to generate audio codes  
         text_embed = self.talker.text_projection(
             self.talker.get_text_embeddings()(torch.cat([ref_id, text_id], 
                                                             dim=-1)))

@@ -30,7 +30,7 @@ from transformers.modeling_outputs import BaseModelOutputWithPast
 
 
 
-from .tokenizer_configuration import Qwen3TTSTokenizerV2Config, Qwen3TTSTokenizerV2DecoderConfig
+from testing.tokenizer_configuration import Qwen3TTSTokenizerV1EncoderConfig, Qwen3TTSTokenizerV1DecoderConfig
 
 
 def rotate_half(x):
@@ -127,7 +127,7 @@ class Qwen3TTSTokenizerDecoderOutput(ModelOutput):
 
 @auto_docstring
 class Qwen3TTSTokenizerDecoderPreTrainedModel(PreTrainedModel):
-    config: Qwen3TTSTokenizerV2DecoderConfig
+    config: Qwen3TTSTokenizerV1DecoderConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
     _skip_keys_device_placement = "past_key_values"
@@ -157,9 +157,9 @@ class Qwen3SpeechTokenizerCausalConvNet(nn.Module):
         
 
     def _get_extra_padding_for_conv1d(self, hidden_state: torch.Tensor) -> int:
-        length = hidden_state.shape[-1] # B x C x L  (L)
-        n_frames = (length - self.kernel_size + self.padding) / self.stride + 1 # classic conv formula (this can be a floating values as well) that tells the dimension value of the output , and here I am saying its frames 
-        ideal_length = math.floor(n_frames) * self.stride + (self.kernel_size - self.padding) # not sure on this 
+        length = hidden_state.shape[-1]
+        n_frames = (length - self.kernel_size + self.padding) / self.stride + 1
+        ideal_length = (math.ceil(n_frames) - 1) * self.stride + (self.kernel_size - self.padding)
         return ideal_length - length
     
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
@@ -208,12 +208,15 @@ class Qwen3SpeechTokenizerConvNeXtBlock(nn.Module):
     
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
         input = hidden_state
-        hidden_state = self.dwconv(hidden_state) # B x C x L 
-        hidden_state = hidden_state.permute(0, 2, 1) # B x L x C
-        hidden_state = self.pwconv2(self.act(self.pwconv1(hidden_state)))
+        hidden_state = self.dwconv(hidden_state)
+        hidden_state = hidden_state.permute(0, 2, 1)
+        hidden_state = self.norm(hidden_state)
+        hidden_state = self.pwconv1(hidden_state)
+        hidden_state = self.act(hidden_state)
+        hidden_state = self.pwconv2(hidden_state)
         hidden_state = self.gamma * hidden_state
         hidden_state = hidden_state.permute(0, 2, 1)
-        hidden_state = input + hidden_state # residual connection
+        hidden_state = input + hidden_state
         return hidden_state
 
 
@@ -422,7 +425,7 @@ class Qwen3SpeechTokenizerDecoderTransformerLayer(nn.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + self.mlp_layer_scale(hidden_states)
-        return hidden_states, self_attn_weights
+        return hidden_states
 
 
 # this is one part of a decoder model , where we are using transformer 
@@ -432,7 +435,7 @@ class Qwen3SpeechTokenizerDecoderTransformerModel(Qwen3TTSTokenizerDecoderPreTra
         "attentions": Qwen3SpeechTokenizerDecoderAttention,
     }
 
-    def __init__(self, config: Qwen3TTSTokenizerV2Config):
+    def __init__(self, config: Qwen3TTSTokenizerV1DecoderConfig):
         super().__init__(config)
         self.layers = nn.ModuleList(
             [Qwen3SpeechTokenizerDecoderTransformerLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
@@ -586,7 +589,7 @@ class Qwen3SpeechTokenizerDecoderResidualUnit(nn.Module):
 # conv decoder block in decoder model  
 # decoder - decoder block ? bad naming convention at least till now , its completely unreadable 
 class Qwen3SpeechTokenizerDecoderDecoderBlock(Qwen3TTSTokenizerDecoderPreTrainedModel):
-    def __init__(self, config: Qwen3TTSTokenizerV2DecoderConfig, layer_idx):
+    def __init__(self, config: Qwen3TTSTokenizerV1DecoderConfig, layer_idx):
         '''
         architecture for this now looks like : 
         activation , conv net , act , conv , act , conv , act , conv .. like this we have multiple layers for this 
@@ -775,7 +778,7 @@ class SplitResidualVectorQuantizer(nn.Module):
 
 # Final decoder model Arrived ! 
 class Qwen3TokenizerDecoder(Qwen3TTSTokenizerDecoderPreTrainedModel):
-    def __init__(self, config: Qwen3TTSTokenizerV2DecoderConfig):
+    def __init__(self, config: Qwen3TTSTokenizerV1DecoderConfig):
         super().__init__(config)
         self.total_upsample = np.prod(config.upsample_rates + config.upsampling_ratios) # product of all values in the array 
         self.pre_transformer = Qwen3SpeechTokenizerDecoderTransformerModel._from_config(config)
@@ -829,6 +832,22 @@ class Qwen3TokenizerDecoder(Qwen3TTSTokenizerDecoderPreTrainedModel):
         for blocks in self.upsample:
             for block in blocks:
                 hidden = block(hidden)
+        wav = hidden
+        for block in self.decoder:
+            wav = block(wav)
+        return wav.clamp(min=-1, max=1)
+
+    def chunked_decode(self, codes, chunk_size=300, left_context_size=25):
+        wavs = []
+        start_index = 0
+        while start_index < codes.shape[-1]:
+            end_index = min(start_index + chunk_size, codes.shape[-1])
+            context_size = left_context_size if start_index - left_context_size > 0 else start_index
+            codes_chunk = codes[..., start_index - context_size : end_index]
+            wav_chunk = self(codes_chunk)
+            wavs.append(wav_chunk[..., context_size * self.total_upsample :])
+            start_index = end_index
+        return torch.cat(wavs, dim=-1)
 
 # this decoder was for audio codes so all that we did was for audio dataset (this needs to be analysed mapped out fully)
 # in encoder we are doing nothing .. we are using all from the mimi model  
@@ -850,7 +869,7 @@ class Qwen3SpeechTokenizerEncoder(MimiModel):
 
 @auto_docstring
 class Qwen3TTSTokenizerV2PreTrainedModel(PreTrainedModel):
-    config: Qwen3TTSTokenizerV2Config
+    config: Qwen3TTSTokenizerV1DecoderConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
     _skip_keys_device_placement = "past_key_values"
@@ -863,7 +882,7 @@ class Qwen3TTSTokenizerV2PreTrainedModel(PreTrainedModel):
 class Qwen3TokenizerModel(Qwen3TTSTokenizerV2PreTrainedModel):
     def __init__(
         self, 
-        config: Qwen3TTSTokenizerV2Config
+        config: Qwen3TTSTokenizerV1DecoderConfig
     ):
         super().__init__(config)
         self.config = config
@@ -933,5 +952,8 @@ class Qwen3TokenizerModel(Qwen3TTSTokenizerV2PreTrainedModel):
             return (audio_values,)
         return Qwen3TTSTokenizerDecoderOutput(audio_values)
 
-__all__ = ["Qwen3TokenizerModel", "Qwen3TTSTokenizerV2PreTrainedModel"]
+__all__ = ["Qwen3TokenizerModel", "Qwen3TTSTokenizerV2PreTrainedModel",
+"Qwen3SpeechTokenizerEncoder", 
+"Qwen3TokenizerDecoder"
+]
 
