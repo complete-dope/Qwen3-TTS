@@ -1438,7 +1438,7 @@ class Qwen3TTSTalkerModel(Qwen3TTSTalkerTextPreTrainedModel):
         self.norm = Qwen3TTSRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3TTSTalkerRotaryEmbedding(config)
         self.gradient_checkpointing = False
-        self.codec_embedding = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.codec_embedding = nn.Embedding(config.vocab_size, config.hidden_size) # just an embedding tabel nothing else   
         self.text_embedding = nn.Embedding(config.text_vocab_size, config.text_hidden_size)
 
         # Initialize weights and apply final processing

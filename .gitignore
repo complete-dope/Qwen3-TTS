@@ -21,5 +21,7 @@ wheels/
 .idea/
 .vscode/
 venv/
+.venv/
 env/
 models--Qwen*
+*.wav

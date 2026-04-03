@@ -61,6 +61,7 @@ that makes us output 32 codes in total so from 1920 samples we got to 32 codes a
 
 # --x--- 
 
+# TTS model follows this part 
 the core for generation remains same : LLM -> so create an embedding table --> then convert to 1024 dims -> pass to talker decoder model -> generates audio codes -> pass to RVQ (generate 31 more) [repeat] ->  tokenizer decoder -> waveform
 
 

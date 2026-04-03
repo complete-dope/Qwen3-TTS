@@ -1669,9 +1669,9 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
 
         self.talker = Qwen3TTSTalkerForConditionalGeneration(self.config.talker_config)
 
-        if config.tts_model_type == "base":
+        if config.tts_model_type == "base": # BASE model differs from encoder model 
             self.speaker_encoder = Qwen3TTSSpeakerEncoder(self.config.speaker_encoder_config)
-        else:
+        else: # encoder model differs   
             self.speaker_encoder = None
 
         self.speech_tokenizer = None
