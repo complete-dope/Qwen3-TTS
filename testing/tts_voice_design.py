@@ -74,11 +74,12 @@ if (
 
 SPEECH_TOK_DIR = os.path.join(MODEL_DIR, "speech_tokenizer")
 OUT_WAV = os.path.join(TESTING, "output_voice_design.wav")
+device = torch.device("mps") if torch.mps.is_available() else torch.device("cpu")
 
 def _load(d):
     state = {}
     for s in sorted(glob.glob(os.path.join(d, "*.safetensors"))):
-        state.update(load_file(s, device="cpu"))
+        state.update(load_file(s, device=device))
     return state
 
 cfg = Qwen3TTSConfig.from_pretrained(MODEL_DIR)
@@ -117,7 +118,7 @@ _hb_stop = threading.Event()
 def _heartbeat() -> None:
     t0 = time.time()
     while not _hb_stop.wait(20.0):
-        print(f"  … generate still running ({time.time() - t0:.0f}s elapsed, 1.7B on CPU is slow)", flush=True)
+        print(f"  … generate still running ({time.time() - t0:.0f}s elapsed, 1.7B on {device} is slow)", flush=True)
 
 _hb = threading.Thread(target=_heartbeat, daemon=True)
 _hb.start()

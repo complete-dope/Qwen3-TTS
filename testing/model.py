@@ -1456,7 +1456,7 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
 
     def __init__(self, config: Qwen3TTSTalkerConfig):
         super().__init__(config)
-        self.model = Qwen3TTSTalkerModel(config)
+        self.model = Qwen3TTSTalkerModel(config) # decoder attention model (hidden states out)
         self.vocab_size = config.vocab_size
         self.text_projection = Qwen3TTSTalkerResizeMLP(
             config.text_hidden_size,
@@ -1464,7 +1464,7 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
             config.hidden_size,
             config.hidden_act,
             bias=True,
-        )
+        ) # resize this to desired size (this is getting used nowhere?) THIS IS GETTING USED IN SOME PARENT CLASS 
         self.codec_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False) # projection from hidden size to the vocab size 
         self.code_predictor = Qwen3TTSTalkerCodePredictorModelForConditionalGeneration(
             config=config.code_predictor_config,
@@ -1613,7 +1613,7 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
             **kwargs,
         )
 
-        hidden_states = outputs.last_hidden_state
+        hidden_states = outputs.last_hidden_state # take out the last hidden state from data model 
         logits = self.codec_head(hidden_states)
 
         loss = None

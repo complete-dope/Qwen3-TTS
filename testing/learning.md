@@ -66,3 +66,12 @@ the core for generation remains same : LLM -> so create an embedding table --> t
 
 
 
+# --x-- 
+
+* Voice design : here we can design voice using instruction / voice prompts  
+
+* Custom voice : Here we can train the model from scratch for the voices that we have , this takes in speaker-id , and model is trained in that way    
+
+* Base model : this model is trained in (text, audio) pairs , data is multilingual speach corpora 
+
+
