@@ -2,6 +2,9 @@ import sys, os, types, glob, logging as _log, threading, time, torch, soundfile 
 from pathlib import Path
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
+import warnings
+warnings.filterwarnings("ignore")
+
 from safetensors.torch import load_file
 from huggingface_hub import snapshot_download
 
@@ -74,7 +77,8 @@ if (
 
 SPEECH_TOK_DIR = os.path.join(MODEL_DIR, "speech_tokenizer")
 OUT_WAV = os.path.join(TESTING, "output_voice_design.wav")
-device = torch.device("mps") if torch.mps.is_available() else torch.device("cpu")
+# device = torch.device("mps") if torch.mps.is_available() else torch.device("cpu")
+device = 'cpu'
 
 def _load(d):
     state = {}
@@ -101,7 +105,7 @@ speech_tok.eval()
 # TOKENIZER : TEXT TOKENIZER 
 text_tok = Qwen2TokenizerFast.from_pretrained(MODEL_DIR)
 
-TEXT = "I am Mohit and I am testing if the voice design TTS works correctly."
+TEXT = "ठीक है। हाँ। मुझे तुमसे नाराज़गी है। मैं तुमसे प्यार करता हूँ। मैं तुम्हारा सम्मान करता हूँ।"
 INSTRUCT = (
     "Speak with a warm Mexican Spanish accent: natural Mexico Spanish, clear articulation, "
     "friendly conversational tone, slight local intonation, not overly formal."

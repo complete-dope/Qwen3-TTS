@@ -32,8 +32,8 @@ MaybeList = Union[Any, List[Any]]
 
 class TTSDataset(Dataset):
     def __init__(self, data_list, processor, config:Qwen3TTSConfig, lag_num = -1):
-        self.data_list = data_list
-        self.processor = processor
+        self.data_list = data_list # data-list 
+        self.processor = processor # 
         self.lag_num = lag_num
         self.config = config
 
@@ -138,7 +138,7 @@ class TTSDataset(Dataset):
         ref_mel = self.extract_mels(audio=wav, sr=sr)
 
         return {
-            "text_ids": text_ids[:,:-5],    # 1 , t
+            "text_ids": text_ids[:,:-5],    # 1 , t # -5 because of the padding tokens
             "audio_codes":audio_codes,      # t, 16
             "ref_mel":ref_mel
         }

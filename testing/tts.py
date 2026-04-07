@@ -60,7 +60,7 @@ speech_tok.eval()
 
 # text tokenizer
 text_tok = Qwen2TokenizerFast.from_pretrained(MODEL_DIR)
-TEXT = "I am Mohit and I am testing if the TTS model works correctly."
+TEXT = "ठीक है। हाँ। मुझे तुमसे नाराज़गी है। मैं तुमसे प्यार करता हूँ। मैं तुम्हारा सम्मान करता हूँ।"
 formatted = f"<|im_start|>assistant\n{TEXT}<|im_end|>\n<|im_start|>assistant\n"
 input_ids = [text_tok(formatted, return_tensors="pt")["input_ids"]]
 

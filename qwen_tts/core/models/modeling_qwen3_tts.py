@@ -307,7 +307,7 @@ class SqueezeExcitationRes2NetBlock(nn.Module):
 
         return hidden_state + residual
 
-# SPEAKER ENCODER MODEL ! 
+# SPEAKER ENCODER MODEL ! (this acts as a speaker classification model so different voices are not mixed in a model)
 class Qwen3TTSSpeakerEncoder(torch.nn.Module):
     """An implementation of the speaker embedding model in a paper.
     "ECAPA-TDNN: Emphasized Channel Attention, Propagation and Aggregation in
@@ -1817,8 +1817,10 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         super().__init__(config)
         self.config = config
 
-        self.talker = Qwen3TTSTalkerForConditionalGeneration(self.config.talker_config)
+        self.talker = Qwen3TTSTalkerForConditionalGeneration(self.config.talker_config) # this runs for all models 
 
+        # Base: arbitrary ref audio -> continuous spk embedding for voice_clone. custom_voice uses talker spk_id
+        # embeddings; voice_design conditions on instruct text (see generate).
         if config.tts_model_type == "base":
             self.speaker_encoder = Qwen3TTSSpeakerEncoder(self.config.speaker_encoder_config)
         else:
@@ -1939,6 +1941,10 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
     
     @torch.inference_mode()
     def extract_speaker_embedding(self, audio, sr):
+        if self.speaker_encoder is None:
+            raise RuntimeError(
+                "extract_speaker_embedding requires tts_model_type=='base'; this checkpoint has no speaker_encoder."
+            )
         assert sr == 24000, "Only support 24kHz audio"
         mels = mel_spectrogram(
             torch.from_numpy(audio).unsqueeze(0), 
