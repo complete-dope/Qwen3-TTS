@@ -68,9 +68,9 @@ input_ids = [text_tok(formatted, return_tensors="pt")["input_ids"]]
 with torch.inference_mode():
     code_list, _ = model.generate(input_ids=input_ids, languages=["auto"])
 
-print('Code list shape is : ', code_list[0].shape)
+print('Code list shape is : ', code_list[0].shape) # 
 
-# decoder uses 16 quantizers — take first 16 codes, shape (1, T, 16)
+# decoder uses 16 quantizers only — take first 16 codes, shape (1, T, 16)
 codes = code_list[0][:, :speech_tok.encoder_valid_num_quantizers].unsqueeze(0)
 dec = speech_tok.decode(codes)
 wav = dec.audio_values[0].detach().cpu().numpy()
