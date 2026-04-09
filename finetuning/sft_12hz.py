@@ -21,6 +21,7 @@ import shutil
 import torch
 from accelerate import Accelerator
 from dataset import TTSDataset
+from huggingface_hub import snapshot_download
 from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
 from safetensors.torch import save_file
 from torch.optim import AdamW
@@ -41,14 +42,16 @@ def train():
     parser.add_argument("--speaker_name", type=str, default="speaker_test")
     args = parser.parse_args()
 
+    attn_impl = "flash_attention_2" if torch.cuda.is_available() else "sdpa"
     accelerator = Accelerator(gradient_accumulation_steps=4, mixed_precision="bf16", log_with="tensorboard")
 
     MODEL_PATH = args.init_model_path
+    local_model_dir = MODEL_PATH if os.path.isdir(MODEL_PATH) else snapshot_download(repo_id=MODEL_PATH)
 
     qwen3tts = Qwen3TTSModel.from_pretrained(
         MODEL_PATH,
         torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+        attn_implementation=attn_impl,
     )
     config = AutoConfig.from_pretrained(MODEL_PATH)
 
@@ -125,9 +128,9 @@ def train():
 
         if accelerator.is_main_process:
             output_dir = os.path.join(args.output_model_path, f"checkpoint-epoch-{epoch}")
-            shutil.copytree(MODEL_PATH, output_dir, dirs_exist_ok=True)
+            shutil.copytree(local_model_dir, output_dir, dirs_exist_ok=True)
 
-            input_config_file = os.path.join(MODEL_PATH, "config.json")
+            input_config_file = os.path.join(local_model_dir, "config.json")
             output_config_file = os.path.join(output_dir, "config.json")
             with open(input_config_file, 'r', encoding='utf-8') as f:
                 config_dict = json.load(f)

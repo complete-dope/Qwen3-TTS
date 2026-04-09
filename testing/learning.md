@@ -9,12 +9,11 @@ https://www.youtube.com/watch?v=hCzJo4ui1P8
 Absolute positional embedding : so they make the core meaning of a word change and this is not what we want to happen so we introduced RoPE.. 
 
 
-
-
 # Talker model 
 
 
-# Speaker model 
+# Speaker model (speaker_encoder)
+This speaker model is used in base model only, this encodes speaker voice codecs 
 
 
 # Tokenizer 
@@ -28,6 +27,8 @@ Causal means input at 'T' should depend on things that are '<= T' and nothing mo
 
 Conv transposed visualised : https://hannibunny.github.io/mlbook/neuralnetworks/convolutionDemos.html
 
+
+Audio Codec : piece of hardware / software that compresses and decompresses digital audio to reduce file size while maintaining sound quality 
 
 
 Tokenizer : Just takes audio waveform as input and uses feature-extractor over top of it and get the values out

@@ -144,6 +144,9 @@ class TTSDataset(Dataset):
         }
         
     def collate_fn(self, batch):
+        '''
+        this is how we make the batches from out __getitem__ method call    
+        '''
         assert self.lag_num == -1
 
         item_length = [b['text_ids'].shape[1] + b['audio_codes'].shape[0] for b in batch]

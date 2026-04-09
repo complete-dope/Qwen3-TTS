@@ -1326,7 +1326,7 @@ class Qwen3TTSTalkerModel(Qwen3TTSTalkerTextPreTrainedModel):
             [Qwen3TTSTalkerDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = Qwen3TTSRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = Qwen3TTSTalkerRotaryEmbedding(config)
+        self.rotary_emb = Qwen3TTSTalkerRotaryEmbedding(config) # some crazy shit , this is taking position ids ( ideally should be relative to what?)
 
         self.gradient_checkpointing = False  # so we are not storing the forward and backward pass for the models and are rather willing to recompute that from scratch
 
@@ -1383,7 +1383,7 @@ class Qwen3TTSTalkerModel(Qwen3TTSTalkerTextPreTrainedModel):
                 past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
             )
 
-        # hardcoded 3 for temporal, height and width.
+        # Rope requires 3 ids, hardcoded 3 for temporal, height and width.
         if position_ids is None:
             position_ids = cache_position.view(1, 1, -1).expand(3, inputs_embeds.shape[0], -1)
         elif position_ids.ndim == 2:
@@ -1420,7 +1420,7 @@ class Qwen3TTSTalkerModel(Qwen3TTSTalkerTextPreTrainedModel):
                 all_hidden_states += (hidden_states,)
 
             layer_outputs = decoder_layer(
-                hidden_states,
+                hidden_states, # input to these decoder layers are hidden states 
                 attention_mask=causal_mask,
                 position_ids=text_position_ids,
                 past_key_values=past_key_values,
@@ -1667,11 +1667,11 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         super().__init__(config)
         self.config = config
 
-        self.talker = Qwen3TTSTalkerForConditionalGeneration(self.config.talker_config)
+        self.talker = Qwen3TTSTalkerForConditionalGeneration(self.config.talker_config) # who is talking 
 
         if config.tts_model_type == "base": # BASE model differs from encoder model 
-            self.speaker_encoder = Qwen3TTSSpeakerEncoder(self.config.speaker_encoder_config)
-        else: # encoder model differs   
+            self.speaker_encoder = Qwen3TTSSpeakerEncoder(self.config.speaker_encoder_config) # who is the voice 
+        else: # encoder model differs 
             self.speaker_encoder = None
 
         self.speech_tokenizer = None
@@ -1757,7 +1757,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
     @torch.inference_mode()
     def generate_speaker_prompt(
         self,
-        voice_clone_prompt: list[dict]
+        voice_clone_prompt: list[dict] # this already has the relevant details required for speaker embedding
     ):
         voice_clone_spk_embeds = []
         for index in range(len(voice_clone_prompt['ref_spk_embedding'])):
@@ -1875,7 +1875,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             voice_clone_spk_embeds = self.generate_speaker_prompt(voice_clone_prompt)
         
         # instruct text prompt generate
-        if instruct_ids is not None:
+        if instruct_ids is not None: # list of list [[] , [] , ...]
             for index, instruct_id in enumerate(instruct_ids):
                 if instruct_id is not None:
                     talker_input_embeds[index].append(self.talker.text_projection(
@@ -1885,6 +1885,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         trailing_text_hiddens = []
         if speakers is None:
             speakers = [None] * len(input_ids)
+            
         for index, (input_id, language, speaker) in enumerate(zip(input_ids, languages, speakers)):
             if voice_clone_spk_embeds is None:
                 if speaker == "" or speaker == None: # Instruct create speaker

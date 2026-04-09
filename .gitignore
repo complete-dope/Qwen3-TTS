@@ -26,3 +26,10 @@ env/
 models--Qwen*
 *.wav
 *.parquet
+
+*.json 
+*.jsonl
+*.log
+.DS_Store
+*.safetensors
+*.txt 
