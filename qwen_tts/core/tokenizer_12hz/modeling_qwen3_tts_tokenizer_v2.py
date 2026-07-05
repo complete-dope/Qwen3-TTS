@@ -1,3 +1,4 @@
+#!/Users/mohitdulani/Desktop/personal/audio-models/.venv/bin/python
 # coding=utf-8
 # Copyright 2026 The Qwen team, Alibaba Group and the HuggingFace Inc. team. All rights reserved.
 #
@@ -31,6 +32,9 @@ from transformers.masking_utils import (
     create_causal_mask,
     create_sliding_window_causal_mask,
 )
+import transformers
+print(transformers.__version__)
+print(transformers.__file__)
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast

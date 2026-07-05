@@ -1,5 +1,3 @@
-# here we are not sending any txt / prompt to the tokenizer 
-
 # ---x---
 
 # coding=utf-8

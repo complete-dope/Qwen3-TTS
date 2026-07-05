@@ -1,3 +1,4 @@
+#!/Users/mohitdulani/Desktop/personal/audio-models/.venv/bin/python
 # mimi model utils and working 
 
 
@@ -8,6 +9,8 @@ librispeech_dummy = load_dataset("hf-internal-testing/librispeech_asr_dummy", "c
 # load model and feature extractor
 model = MimiModel.from_pretrained("kyutai/mimi")
 feature_extractor = AutoFeatureExtractor.from_pretrained("kyutai/mimi")
+print('model :: ' , model)
+print('feature extractor :: ' , feature_extractor)
 
 # load audio sample
 librispeech_dummy = librispeech_dummy.cast_column("audio", Audio(sampling_rate=feature_extractor.sampling_rate))

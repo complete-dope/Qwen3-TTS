@@ -220,7 +220,6 @@ class Qwen3SpeechTokenizerConvNeXtBlock(nn.Module):
         return hidden_state
 
 
-# TBD later
 class Qwen3SpeechTokenizerDecoderRotaryEmbedding(nn.Module):
     def __init__(self, config , device=None) -> None:
         super().__init__()

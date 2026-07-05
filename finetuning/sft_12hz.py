@@ -75,14 +75,14 @@ def train():
 
                 input_ids = batch['input_ids']
                 codec_ids = batch['codec_ids']
-                ref_mels = batch['ref_mels']
                 text_embedding_mask = batch['text_embedding_mask']
+                ref_mels = batch['ref_mels']
                 codec_embedding_mask = batch['codec_embedding_mask']
                 attention_mask = batch['attention_mask']
                 codec_0_labels = batch['codec_0_labels']
                 codec_mask = batch['codec_mask']
 
-                speaker_embedding = model.speaker_encoder(ref_mels.to(model.device).to(model.dtype)).detach()
+                speaker_embedding = model.speaker_encoder(ref_mels.to(model.device).to(model.dtype)).detach() # grads wont be updated for this 
                 if target_speaker_embedding is None:
                     target_speaker_embedding = speaker_embedding
 

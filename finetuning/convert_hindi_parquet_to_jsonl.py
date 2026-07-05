@@ -110,3 +110,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+#python convert_hindi_parquet_to_jsonl.py --parquet_dir
+
